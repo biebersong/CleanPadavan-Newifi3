@@ -220,29 +220,42 @@ jobs:
             app="$1"
             if [ -d "$app" ]; then
               echo ">>> Stubbing user/$app"
-              cat > "$app/Makefile" <<'EOF'
-              .RECIPEPREFIX := >
-              all:
-              > @echo "stubbed"
-              romfs:
-              > @echo "stubbed"
-              clean:
-              > @true
-              EOF
+              printf '%s\n' \
+                '.RECIPEPREFIX := >' \
+                'all:' \
+                '> @echo "stubbed"' \
+                'romfs:' \
+                '> @echo "stubbed"' \
+                'clean:' \
+                '> @true' > "$app/Makefile"
             else
               echo ">>> Skip missing user/$app"
             fi
           }
 
-          for app in             802.1x             wpa_supplicant             miniupnpd             igmpproxy             udpxy             inadyn             openssh             openvpn             samba36             wsdd2             ttyd             softethervpn             transmission             aria2             lrzszt; do
+          for app in \
+            802.1x \
+            wpa_supplicant \
+            miniupnpd \
+            igmpproxy \
+            udpxy \
+            inadyn \
+            openssh \
+            openvpn \
+            samba36 \
+            wsdd2 \
+            ttyd \
+            softethervpn \
+            transmission \
+            aria2 \
+            lrzsz; do
             stub_app "$app"
           done
-
       - name: (Kernel 3.4) Show Stubbed User Apps
         if: env.KERNEL_VER == '3.4'
         run: |
           cd ${{ env.WORK_DIR }}/trunk/user
-          for app in 802.1x wpa_supplicant miniupnpd igmpproxy udpxy inadyn openssh openvpn samba36 wsdd2 ttyd softethervpn transmission aria2 lrzszt; do
+          for app in 802.1x wpa_supplicant miniupnpd igmpproxy udpxy inadyn openssh openvpn samba36 wsdd2 ttyd softethervpn transmission aria2 lrzsz; do
             if [ -f "$app/Makefile" ]; then
               echo "===== $app/Makefile ====="
               sed -n '1,12p' "$app/Makefile"
