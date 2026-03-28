@@ -1,0 +1,390 @@
+name: Build Newifi3 D2 SAFE Wired IPv6
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Select Kernel Version'
+        required: true
+        default: '3.4'
+        type: choice
+        options:
+          - '3.4 (Hanwckf + KVR)'
+          - '4.4 (MeIsReallyBa)'
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/biaogo94/cleanpadavan-newifi3/padavan-builder:latest
+      options: --user root
+
+    steps:
+      - name: Checkout CI Scripts
+        uses: actions/checkout@v4
+
+      - name: Initialize Environment Variables
+        id: init
+        run: |
+          INPUT_VER="${{ github.event.inputs.target_version }}"
+          echo "User Input: $INPUT_VER"
+
+          case "$INPUT_VER" in
+            *"4.4"*)
+              echo "✅ Mode: Kernel 4.4 (MeIsReallyBa)"
+              echo "KERNEL_VER=4.4" >> $GITHUB_ENV
+              echo "REPO_URL=https://github.com/MeIsReallyBa/padavan-4.4.git" >> $GITHUB_ENV
+              echo "REPO_BRANCH=main" >> $GITHUB_ENV
+              echo "TARGET_PROFILE=NEWIFI" >> $GITHUB_ENV
+              ;;
+            *)
+              echo "☑️ Mode: Kernel 3.4 (Hanwckf)"
+              echo "KERNEL_VER=3.4" >> $GITHUB_ENV
+              echo "REPO_URL=https://github.com/hanwckf/rt-n56u.git" >> $GITHUB_ENV
+              echo "REPO_BRANCH=master" >> $GITHUB_ENV
+              echo "TARGET_PROFILE=NEWIFI3" >> $GITHUB_ENV
+              ;;
+          esac
+
+          echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+          echo "WORK_DIR=${{ github.workspace }}/padavan" >> $GITHUB_ENV
+
+      - name: Clone Source Code
+        run: |
+          echo "Cloning from ${{ env.REPO_URL }} (Branch: ${{ env.REPO_BRANCH }})..."
+          git clone --depth=1 --branch ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} ${{ env.WORK_DIR }}
+
+      - name: Cache Toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORK_DIR }}/toolchain-mipsel
+          key: pkg-toolchain-${{ env.KERNEL_VER }}
+
+      - name: Prepare Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ${{ env.WORK_DIR }}/toolchain-mipsel
+          cd ${{ env.WORK_DIR }}/toolchain-mipsel
+
+          echo "Checking for downloader script..."
+          ls -lh dl_toolchain.sh || echo "Script not listed."
+
+          if [ -f "dl_toolchain.sh" ]; then
+            echo "✅ Script found! Executing dl_toolchain.sh..."
+            sh dl_toolchain.sh
+          else
+            echo "⚠️ Script NOT found. Downloading toolchain manually (Fallback)..."
+            wget -O toolchain.tar.xz https://github.com/hanwckf/padavan-toolchain/releases/download/v1.1/mipsel-linux-uclibc.tar.xz
+            tar -xvf toolchain.tar.xz
+            rm -f toolchain.tar.xz
+
+            if [ -d "toolchain-3.4.x" ]; then
+              echo "✅ Toolchain extracted."
+            else
+              echo "::error:: Toolchain failed to extract."
+              exit 1
+            fi
+          fi
+
+      - name: Link Toolchain
+        run: |
+          mkdir -p /opt/rt-n56u
+          sudo ln -sf ${{ env.WORK_DIR }}/toolchain-mipsel /opt/rt-n56u/toolchain-mipsel
+          ls -l /opt/rt-n56u/toolchain-mipsel
+
+      - name: (Kernel 3.4) Apply KVR & Fixes
+        if: env.KERNEL_VER == '3.4'
+        run: |
+          cd ${{ env.WORK_DIR }}
+
+          echo ">>> Applying KVR patches..."
+          KVR_TEMP="/tmp/padavan_kvr"
+          rm -rf $KVR_TEMP
+          git clone --depth=1 https://github.com/vb1980/Padavan-KVR.git $KVR_TEMP
+
+          DEST_DRIVER_DIR="${{ env.WORK_DIR }}/trunk/proprietary_driver/rt_wifi"
+          SRC_MT7603=$(find $KVR_TEMP -type d -name "mt7603e*" -print -quit)
+          SRC_MT7612=$(find $KVR_TEMP -type d -name "mt7612e*" -print -quit)
+
+          if [ -n "$SRC_MT7603" ]; then
+            rm -rf $DEST_DRIVER_DIR/mt7603e
+            cp -r "$SRC_MT7603" $DEST_DRIVER_DIR/mt7603e
+          fi
+
+          if [ -n "$SRC_MT7612" ]; then
+            rm -rf $DEST_DRIVER_DIR/mt7612e
+            cp -r "$SRC_MT7612" $DEST_DRIVER_DIR/mt7612e
+          fi
+
+          rm -rf $KVR_TEMP
+
+          sed -i 's/$(MAKE) -C $(XZ_DIR)/sed -i "s\/ po \/ \/g" $(XZ_DIR)\/Makefile; $(MAKE) -C $(XZ_DIR)/g' trunk/tools/mksquashfs_xz/Makefile
+          sed -i 's|./configure|export CFLAGS="-I/usr/include/tirpc"; export LIBS="-ltirpc"; ./configure|g' trunk/user/dropbear/Makefile
+
+      - name: (Kernel 3.4) Configure Target
+        if: env.KERNEL_VER == '3.4'
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+
+          if [ -f "configs/templates/NEWIFI3.config" ]; then
+            cp -f configs/templates/NEWIFI3.config .config
+          else
+            cp -f configs/templates/newifi3.config .config
+          fi
+
+          sed -i 's/CONFIG_FIRMWARE_WIFI2_DRIVER=.*$/CONFIG_FIRMWARE_WIFI2_DRIVER=5.0/g' .config
+          sed -i 's/CONFIG_FIRMWARE_WIFI5_DRIVER=.*$/CONFIG_FIRMWARE_WIFI5_DRIVER=3.0/g' .config
+          sed -i '/CONFIG_FIRMWARE_INCLUDE_WIFI_KVR/d' .config
+          echo 'CONFIG_FIRMWARE_INCLUDE_WIFI_KVR=y' >> .config
+
+          # ===== 16MB + 校园网 + IPv6 + NAT66 + FAT32/NTFS =====
+          # 核心保留
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_IPV6=n/CONFIG_FIRMWARE_ENABLE_IPV6=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_USB=n/CONFIG_FIRMWARE_ENABLE_USB=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_CURL=n/CONFIG_FIRMWARE_INCLUDE_CURL=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_DOGCOM=n/CONFIG_FIRMWARE_INCLUDE_DOGCOM=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_NAPT66=n/CONFIG_FIRMWARE_INCLUDE_NAPT66=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_DROPBEAR=n/CONFIG_FIRMWARE_INCLUDE_DROPBEAR=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_OPENSSH=y/CONFIG_FIRMWARE_INCLUDE_OPENSSH=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_LANG_CN=n/CONFIG_FIRMWARE_INCLUDE_LANG_CN=y/g' .config
+
+          # USB 文件系统: 只保留 FAT32 + NTFS(Paragon UFSD)
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_UFSD=n/CONFIG_FIRMWARE_ENABLE_UFSD=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_FAT=n/CONFIG_FIRMWARE_ENABLE_FAT=y/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_EXFAT=y/CONFIG_FIRMWARE_ENABLE_EXFAT=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_EXT2=y/CONFIG_FIRMWARE_ENABLE_EXT2=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_EXT3=y/CONFIG_FIRMWARE_ENABLE_EXT3=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_EXT4=y/CONFIG_FIRMWARE_ENABLE_EXT4=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_FUSE=y/CONFIG_FIRMWARE_ENABLE_FUSE=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_NTFS_3G=y/CONFIG_FIRMWARE_INCLUDE_NTFS_3G=n/g' .config
+
+          # 校园网认证只保留 dogcom
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_MINIEAP=y/CONFIG_FIRMWARE_INCLUDE_MINIEAP=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_NJIT_CLIENT=y/CONFIG_FIRMWARE_INCLUDE_NJIT_CLIENT=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_MENTOHUST=y/CONFIG_FIRMWARE_INCLUDE_MENTOHUST=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SCUTCLIENT=y/CONFIG_FIRMWARE_INCLUDE_SCUTCLIENT=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_GDUT_DRCOM=y/CONFIG_FIRMWARE_INCLUDE_GDUT_DRCOM=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_EAP_PEAP=y/CONFIG_FIRMWARE_INCLUDE_EAP_PEAP=n/g' .config
+
+          # 大件与无关功能全部关闭
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_OPENVPN=y/CONFIG_FIRMWARE_INCLUDE_OPENVPN=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_WIREGUARD=y/CONFIG_FIRMWARE_INCLUDE_WIREGUARD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_SERVER=y/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_SERVER=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_CLIENT=y/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_CLIENT=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_CMD=y/CONFIG_FIRMWARE_INCLUDE_SOFTETHERVPN_CMD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION=y/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION_WEB_CONTROL=y/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION_WEB_CONTROL=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_ARIA=y/CONFIG_FIRMWARE_INCLUDE_ARIA=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_ARIA_WEB_CONTROL=y/CONFIG_FIRMWARE_INCLUDE_ARIA_WEB_CONTROL=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SMBD=y/CONFIG_FIRMWARE_INCLUDE_SMBD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_FTPD=y/CONFIG_FIRMWARE_INCLUDE_FTPD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_TTYD=y/CONFIG_FIRMWARE_INCLUDE_TTYD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_VLMCSD=y/CONFIG_FIRMWARE_INCLUDE_VLMCSD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_HTOP=y/CONFIG_FIRMWARE_INCLUDE_HTOP=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_NANO=y/CONFIG_FIRMWARE_INCLUDE_NANO=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_IPERF3=y/CONFIG_FIRMWARE_INCLUDE_IPERF3=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_DUMP1090=y/CONFIG_FIRMWARE_INCLUDE_DUMP1090=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_RTL_SDR=y/CONFIG_FIRMWARE_INCLUDE_RTL_SDR=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_MTR=y/CONFIG_FIRMWARE_INCLUDE_MTR=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SOCAT=y/CONFIG_FIRMWARE_INCLUDE_SOCAT=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SRELAY=y/CONFIG_FIRMWARE_INCLUDE_SRELAY=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_TCPDUMP=y/CONFIG_FIRMWARE_INCLUDE_TCPDUMP=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_PARTED=y/CONFIG_FIRMWARE_INCLUDE_PARTED=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_UVC=y/CONFIG_FIRMWARE_INCLUDE_UVC=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_AUDIO=y/CONFIG_FIRMWARE_INCLUDE_AUDIO=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_LPRD=y/CONFIG_FIRMWARE_INCLUDE_LPRD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_U2EC=y/CONFIG_FIRMWARE_INCLUDE_U2EC=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_HDPARM=y/CONFIG_FIRMWARE_INCLUDE_HDPARM=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_XUPNPD=y/CONFIG_FIRMWARE_INCLUDE_XUPNPD=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_SFTP=y/CONFIG_FIRMWARE_INCLUDE_SFTP=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EXE=y/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EXE=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EC=y/CONFIG_FIRMWARE_INCLUDE_OPENSSL_EC=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_IPSET=y/CONFIG_FIRMWARE_INCLUDE_IPSET=n/g' .config
+          sed -i 's/CONFIG_FIRMWARE_INCLUDE_LRZSZ=y/CONFIG_FIRMWARE_INCLUDE_LRZSZ=n/g' .config
+
+          # 保留硬件加速
+          sed -i 's/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=n/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=y/g' .config
+
+      - name: (Kernel 3.4) Show Final Key Config
+        if: env.KERNEL_VER == '3.4'
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+          grep -E '^(CONFIG_FIRMWARE_ENABLE_(IPV6|USB|UFSD|FAT|EXFAT|EXT2|EXT3|EXT4|FUSE)|CONFIG_FIRMWARE_INCLUDE_(DOGCOM|MINIEAP|NJIT_CLIENT|NAPT66|DROPBEAR|OPENSSH|SMBD|TRANSMISSION|TRANSMISSION_WEB_CONTROL|ARIA|ARIA_WEB_CONTROL|OPENVPN|WIREGUARD|SOFTETHERVPN_SERVER|SOFTETHERVPN_CLIENT|SOFTETHERVPN_CMD|CURL|SFTP|OPENSSL_EXE|OPENSSL_EC|IPSET|TCPDUMP|PARTED|AUDIO|TTYD|VLMCSD|HTOP|NANO|IPERF3|DUMP1090|RTL_SDR|MTR|SOCAT|SRELAY|LPRD|U2EC|HDPARM|XUPNPD|FTPD|LRZSZ|EAP_PEAP|WIFI_KVR)|CONFIG_FIRMWARE_INCLUDE_LANG_CN|CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD)=' .config | sort
+
+      - name: (Kernel 3.4) Force Trim User Build List
+        if: env.KERNEL_VER == '3.4'
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+
+          echo ">>> Force trimming trunk/user/Makefile build list ..."
+          python3 - <<'PY2'
+from pathlib import Path
+p = Path('user/Makefile')
+s = p.read_text()
+remove = [
+    'ipset',
+    'inadyn',
+    'miniupnpd',
+    'igmpproxy',
+    'udpxy',
+    '802.1x',
+    'wpa_supplicant',
+    'openssh',
+    'htop',
+    'nano',
+    'openvpn',
+    'xupnpd',
+    'tcpdump',
+    'mtr',
+    'socat',
+    'srelay',
+    'wireguard-go',
+    'wireguard-tools',
+    'samba36',
+    'wsdd2',
+    'ttyd',
+    'softethervpn',
+    'vlmcsd',
+    'lrzsz',
+    'iperf3',
+    'minieap',
+    'njit-client',
+    'hdparm',
+    'p910nd',
+    'usb-modeswitch',
+    'comgt-0.32',
+    'uqmi',
+    'LPRng',
+    'u2ec',
+    'dump1090',
+    'e2fsprogs',
+    'parted',
+    'vsftpd',
+    'transmission',
+    'aria2',
+]
+for name in remove:
+    s = s.replace(f' dir_y += {name}', '')
+    s = s.replace(f' dir_$(SAMBA_ENABLED) += {name}', '')
+    s = s.replace(f' dir_$(DROPBEAR_ENABLED) += {name}', '')
+    s = s.replace(f' dir_$(OPENSSH_ENABLED) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_HTOP) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_NANO) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_OPENVPN) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_XUPNPD) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_TCPDUMP) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_MTR) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_SOCAT) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_SRELAY) += {name}', '')
+    s = s.replace(f' dir_$(FRP_ENABLE) += {name}', '')
+    s = s.replace(f' dir_$(SOFTETHERVPN_ENABLE) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_VLMCSD) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_LRZSZ) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_IPERF3) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_MINIEAP) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_NJIT_CLIENT) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_HDPARM) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_LPRD) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_U2EC) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_DUMP1090) += {name}', '')
+    s = s.replace(f' dir_$(FS_EXT_ENABLED) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_PARTED) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_FTPD) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_TRANSMISSION) += {name}', '')
+    s = s.replace(f' dir_$(CONFIG_FIRMWARE_INCLUDE_ARIA) += {name}', '')
+p.write_text(s)
+PY2
+
+          echo ">>> Verifying removed user components ..."
+          python3 - <<'PY3'
+from pathlib import Path
+s = Path('user/Makefile').read_text()
+bad = [
+    'ipset','inadyn','miniupnpd','igmpproxy','udpxy','802.1x','wpa_supplicant',
+    'openssh','htop','nano','openvpn','xupnpd','tcpdump','mtr','socat','srelay',
+    'wireguard-go','wireguard-tools','samba36','wsdd2','ttyd','softethervpn',
+    'vlmcsd','lrzsz','iperf3','minieap','njit-client','hdparm','p910nd',
+    'usb-modeswitch','comgt-0.32','uqmi','LPRng','u2ec','dump1090','e2fsprogs',
+    'parted','vsftpd','transmission','aria2'
+]
+found = []
+for name in bad:
+    if f'+= {name}' in s:
+        found.append(name)
+if found:
+    print('Still present in user/Makefile:', ', '.join(found))
+    raise SystemExit(1)
+print('user/Makefile trim OK')
+PY3
+
+      - name: (Kernel 4.4) Configure Target
+        if: env.KERNEL_VER == '4.4'
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+          CONFIG_FILE="configs/boards/${{ env.TARGET_PROFILE }}/board.mk"
+          echo "Modifying config: $CONFIG_FILE"
+          if [ -f "$CONFIG_FILE" ]; then
+            sed -i 's/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=n/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=y/g' $CONFIG_FILE
+            for APP in ARIA TRANSMISSION OPENVPN SMARTDNS TROJAN; do
+              sed -i "s/CONFIG_FIRMWARE_INCLUDE_${APP}=y/CONFIG_FIRMWARE_INCLUDE_${APP}=n/g" $CONFIG_FILE
+            done
+          else
+            echo "::error:: Board Config file not found!"
+            exit 1
+          fi
+
+      - name: Common Customization
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+          if [ -f .config ]; then
+            sed -i 's/CONFIG_FIRMWARE_INCLUDE_ARIA=y/CONFIG_FIRMWARE_INCLUDE_ARIA=n/g' .config
+            sed -i 's/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION=y/CONFIG_FIRMWARE_INCLUDE_TRANSMISSION=n/g' .config
+            sed -i 's/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=n/CONFIG_FIRMWARE_ENABLE_FLOWOFFLOAD=y/g' .config
+            sed -i 's/CONFIG_FIRMWARE_INCLUDE_RTL_SDR=y/CONFIG_FIRMWARE_INCLUDE_RTL_SDR=n/g' .config
+          fi
+
+      - name: Compile Firmware
+        run: |
+          cd ${{ env.WORK_DIR }}/trunk
+          ./clear_tree || true
+          echo "Building..."
+          fakeroot ./build_firmware ${{ env.TARGET_PROFILE }}
+
+          if ! find images -maxdepth 1 -name '*.trx' | grep -q .; then
+            echo "::error:: Compilation failed! No .trx file generated."
+            exit 1
+          fi
+
+      - name: Organize Artifacts
+        run: |
+          mkdir -p output_firmware
+          for f in ${{ env.WORK_DIR }}/trunk/images/*.trx; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f" .trx)"
+            cp "$f" "output_firmware/${base}_SAFE-WIRED-V2-${{ env.KERNEL_VER }}_${{ env.BUILD_DATE }}.trx"
+          done
+          ls -lh output_firmware/
+
+      - name: Upload Firmware to Release
+        uses: softprops/action-gh-release@v1
+        if: success()
+        with:
+          tag_name: safe-wired-v2-${{ env.BUILD_DATE }}-${{ env.KERNEL_VER }}
+          name: Newifi3 D2 SAFE Wired IPv6 v2 ${{ env.KERNEL_VER }} (${{ env.BUILD_DATE }})
+          body: |
+            Newifi3 D2 SAFE Wired IPv6 build v2
+            Kernel: ${{ env.KERNEL_VER }}
+            Profile: wired uplink / AP only
+            Kept: DOGCOM, IPv6, NAPT66, FAT32, NTFS(UFSD), KVR, Flow Offload
+            Removed: forced user components, 802.1x, wpa_supplicant, extra campus auth clients, VPN/download suites, USB modem/printer helpers
+          files: output_firmware/*.trx
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
